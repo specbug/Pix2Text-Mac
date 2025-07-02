@@ -1,6 +1,213 @@
 import SwiftUI
 import AppKit
 import Combine
+import WebKit
+
+class AppState: ObservableObject {
+    @Published var capturedImage: NSImage?
+    @Published var latexResult: String = ""
+    @Published var isProcessing: Bool = false
+    @Published var confidence: Double = 0.0
+
+    private var lastClipboardChangeCount = -1
+
+    func checkClipboardForImageAndProcess() {
+        let pasteboard = NSPasteboard.general
+        guard pasteboard.changeCount != lastClipboardChangeCount else {
+            return
+        }
+        lastClipboardChangeCount = pasteboard.changeCount
+
+        guard let image = NSImage(pasteboard: pasteboard) else {
+            return
+        }
+        
+        self.capturedImage = image
+        self.isProcessing = true
+        self.latexResult = "Processing..."
+        self.confidence = 0.0
+        
+        callPix2Text(with: image)
+    }
+
+    private func callPix2Text(with image: NSImage) {
+        guard let tempURL = saveImageTemporarily(image) else {
+            DispatchQueue.main.async {
+                self.latexResult = "Error: Could not save image for processing."
+                self.isProcessing = false
+            }
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let task = Process()
+
+            // Hardcoded path to your local python virtual environment.
+            // TODO: Make this more robust for distribution.
+            let pythonPath = "/Users/rishitv/Documents/Personal/Pix2Text-Mac/.venv/bin/python"
+            
+            guard FileManager.default.fileExists(atPath: pythonPath) else {
+                DispatchQueue.main.async {
+                    self.latexResult = "Error: Python venv not found at \(pythonPath). Please update the path in Pix2TextApp.swift"
+                    self.isProcessing = false
+                }
+                return
+            }
+            
+            guard let scriptPath = Bundle.main.path(forResource: "pix2text_bridge", ofType: "py") else {
+                DispatchQueue.main.async {
+                    self.latexResult = "Error: pix2text_bridge.py not found in app bundle."
+                    self.isProcessing = false
+                    try? FileManager.default.removeItem(at: tempURL)
+                }
+                return
+            }
+            
+            task.executableURL = URL(fileURLWithPath: pythonPath)
+            task.arguments = [scriptPath, "file", tempURL.path]
+
+            let outPipe = Pipe()
+            task.standardOutput = outPipe
+            let errPipe = Pipe()
+            task.standardError = errPipe
+
+            do {
+                try task.run()
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
+                
+                let rawOutput = String(data: outData, encoding: .utf8) ?? ""
+
+                if let jsonString = self.extractJsonString(from: rawOutput) {
+                    self.parsePythonResponse(jsonString)
+                } else {
+                    let errOutput = String(data: errData, encoding: .utf8) ?? ""
+                    DispatchQueue.main.async {
+                        var errorMessage = "Error: Could not find valid JSON in script output."
+                        if !rawOutput.isEmpty {
+                            errorMessage += "\n\n--- Script Output ---\n\(rawOutput)"
+                        }
+                        if !errOutput.isEmpty {
+                            errorMessage += "\n\n--- Script Error Log ---\n\(errOutput)"
+                        }
+                        self.latexResult = errorMessage
+                        self.isProcessing = false
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.latexResult = "Error: Failed to run script. \(error.localizedDescription)"
+                    self.isProcessing = false
+                }
+            }
+            
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+    }
+
+    private func saveImageTemporarily(_ image: NSImage) -> URL? {
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = "p2t-capture-\(UUID().uuidString).png"
+        let tempURL = tempDir.appendingPathComponent(fileName)
+
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+
+        do {
+            try pngData.write(to: tempURL)
+            return tempURL
+        } catch {
+            return nil
+        }
+    }
+
+    private func cleanLatexString(_ rawString: String) -> String {
+        // Find content within $$...$$
+        if let startRange = rawString.range(of: "$$"),
+           let endRange = rawString.range(of: "$$", options: .backwards),
+           startRange.lowerBound != endRange.lowerBound {
+            let startIndex = rawString.index(startRange.lowerBound, offsetBy: 2)
+            let endIndex = endRange.lowerBound
+            if startIndex < endIndex {
+                return String(rawString[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        
+        // Fallback: Find content within $...$
+        if let startRange = rawString.range(of: "$"),
+           let endRange = rawString.range(of: "$", options: .backwards),
+           startRange.lowerBound != endRange.lowerBound {
+            let startIndex = rawString.index(startRange.lowerBound, offsetBy: 1)
+            let endIndex = endRange.lowerBound
+            if startIndex < endIndex {
+                return String(rawString[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        
+        // If no delimiters are found, return the trimmed string
+        return rawString.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func extractJsonString(from string: String) -> String? {
+        // Find the first opening curly brace
+        guard let startRange = string.range(of: "{") else {
+            return nil
+        }
+        
+        // Find the last closing curly brace
+        guard let endRange = string.range(of: "}", options: .backwards) else {
+            return nil
+        }
+        
+        let potentialJson = String(string[startRange.lowerBound...endRange.lowerBound])
+        
+        // A simple validation to see if it's likely our JSON
+        if potentialJson.contains("\"success\"") || potentialJson.contains("\"error\"") {
+            return potentialJson
+        }
+        
+        return nil
+    }
+
+    private func parsePythonResponse(_ response: String) {
+        guard let data = response.data(using: .utf8) else {
+            DispatchQueue.main.async {
+                self.latexResult = "Error: Could not decode script response."
+                self.isProcessing = false
+            }
+            return
+        }
+
+        DispatchQueue.main.async {
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
+                    if let error = json["error"] as? String {
+                        var errorMessage = "Error: \(error)"
+                        if let traceback = json["traceback"] as? String {
+                            errorMessage += "\n\n--- Traceback ---\n\(traceback)"
+                        }
+                        self.latexResult = errorMessage
+                        self.confidence = 0.0
+                    } else if let latex = json["latex"] as? String {
+                        self.latexResult = self.cleanLatexString(latex)
+                        self.confidence = json["confidence"] as? Double ?? 0.0
+                    } else {
+                        self.latexResult = "Error: Invalid JSON response from script."
+                        self.confidence = 0.0
+                    }
+                }
+            } catch {
+                self.latexResult = "Error: Failed to parse JSON. \(error.localizedDescription)"
+                self.confidence = 0.0
+            }
+            self.isProcessing = false
+        }
+    }
+}
 
 @main
 struct Pix2TextApp: App {
@@ -16,6 +223,7 @@ struct Pix2TextApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
+    var appState = AppState()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("🚀 Mathpix Replica Version Loading...")
@@ -32,7 +240,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.contentSize = NSSize(width: 680, height: 540)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: ContentView())
+        popover.contentViewController = NSHostingController(rootView: ContentView().environmentObject(appState))
         
         print("✅ Mathpix Replica UI ready!")
     }
@@ -42,6 +250,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown {
                 popover.performClose(nil)
             } else {
+                appState.checkClipboardForImageAndProcess()
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: NSRectEdge.minY)
                 popover.contentViewController?.view.window?.makeKey()
             }
@@ -64,6 +273,8 @@ struct MathpixTheme {
 
 // MARK: - MAIN CONTENT VIEW
 struct ContentView: View {
+    @EnvironmentObject var appState: AppState
+
     var body: some View {
         VStack(spacing: 0) {
             TopBarView()
@@ -73,6 +284,9 @@ struct ContentView: View {
             ConfidenceBar()
         }
         .background(MathpixTheme.background)
+        .onAppear {
+            appState.checkClipboardForImageAndProcess()
+        }
     }
 }
 
@@ -128,6 +342,7 @@ struct ToolButton: View {
 
 // MARK: - IMAGE & FORMULA DISPLAY
 struct ImageAndFormulaView: View {
+    @EnvironmentObject var appState: AppState
     @State private var isOriginalVisible = false
 
     var body: some View {
@@ -155,19 +370,26 @@ struct ImageAndFormulaView: View {
             // The actual formula display
             VStack {
                 if isOriginalVisible {
-                    Image("math-formula-42")
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFit()
-                        .background(MathpixTheme.originalImageBackground)
-                        .padding(.bottom, 20)
+                    if let image = appState.capturedImage {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFit()
+                            .background(MathpixTheme.originalImageBackground)
+                            .padding(.bottom, 20)
+                    } else {
+                        Text("Copy an image to get started.")
+                            .foregroundColor(MathpixTheme.textSecondary)
+                            .padding()
+                    }
                 }
 
-                Text("a_{\\mathrm{av}-x}=\\frac{v_{2 x}-v_{1 x}}{t_{2}-t_{1}}=\\frac{\\Delta v_{x}}{\\Delta t}")
-                    .font(.system(size: 36, design: .serif))
-                    .foregroundColor(MathpixTheme.textPrimary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
+                if appState.isProcessing {
+                    ProgressView()
+                } else if !appState.latexResult.isEmpty {
+                    LatexView(latex: appState.latexResult)
+                        .padding(.horizontal, 40)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -175,15 +397,96 @@ struct ImageAndFormulaView: View {
     }
 }
 
+struct LatexView: NSViewRepresentable {
+    let latex: String
+
+    func makeNSView(context: Context) -> WKWebView {
+        let prefs = WKPreferences()
+        prefs.javaScriptEnabled = true
+        
+        let config = WKWebViewConfiguration()
+        config.preferences = prefs
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.setValue(false, forKey: "drawsBackground") // Make it transparent
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        let html = katexHTML(with: latex)
+        nsView.loadHTMLString(html, baseURL: nil)
+    }
+
+    private func katexHTML(with latexString: String) -> String {
+        let escapedLatex = latexString.replacingOccurrences(of: "\\", with: "\\\\")
+                                     .replacingOccurrences(of: "`", with: "\\`")
+                                     .replacingOccurrences(of: "$", with: "\\$")
+
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css" integrity="sha384-vKruJ+a13U8yHIkAyOUuDfiCvE9mdLPJNcrOOLAupAbGdxvs2goRaN2uhpqkvUUB" crossorigin="anonymous">
+            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.js" integrity="sha384-PwRUT/YqbnEjkMWVphVRFF3eGmMKaTmmvYypNoLgjGkhtuUY_9VycKDVJAk1SgQ/" crossorigin="anonymous"></script>
+            <style>
+                body {
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    margin: 0;
+                    background-color: transparent !important;
+                    color: \(cssColor(from: MathpixTheme.textPrimary));
+                    font-size: 22px;
+                }
+                .katex-display {
+                    margin: 0;
+                }
+            </style>
+        </head>
+        <body>
+            <div id="latex-content"></div>
+            <script>
+                document.addEventListener("DOMContentLoaded", function() {
+                    katex.render(`\(escapedLatex)`, document.getElementById('latex-content'), {
+                        throwOnError: false,
+                        displayMode: true
+                    });
+                });
+            </script>
+        </body>
+        </html>
+        """
+    }
+
+    private func cssColor(from color: Color) -> String {
+        let nsColor = NSColor(color)
+        if let rgbColor = nsColor.usingColorSpace(.sRGB) {
+            let red = Int(round(rgbColor.redComponent * 255))
+            let green = Int(round(rgbColor.greenComponent * 255))
+            let blue = Int(round(rgbColor.blueComponent * 255))
+            return "rgb(\(red), \(green), \(blue))"
+        }
+        return "#212121"
+    }
+}
+
 // MARK: - RESULTS LIST
 struct ResultsView: View {
+    @EnvironmentObject var appState: AppState
     @State private var copiedResultId: Int? = 0
-    let results: [LatexResult] = [
-        .init(id: 0, text: "a_{\\mathrm{av}-x}=\\frac{v_{2 x}-v_{1 x}}{t_{2}-t_{1}}=\\frac{\\Delta v_{x}}{\\Delta t}"),
-        .init(id: 1, text: "$a_{\\mathrm{av}-x}=\\frac{v_{2 x}-v_{1 x}}{t_{2}-t_{1}}=\\frac{\\Delta v_{x}}{\\Delta t}$"),
-        .init(id: 2, text: "$$ a_{\\mathrm{av}-x}=\\frac{v_{2 x}-v_{1 x}}{t_{2}-t_{1}}=\\frac{\\Delta v_{x}}{\\Delta t} $$"),
-        .init(id: 3, text: "\\begin{equation} a_{\\mathrm{av}-x}=\\frac{v_{2 x}-v_{1 x}}{t_{2}-t_{1}}=\\frac{\\Delta v_{x}}{\\Delta t} \\end{equation}")
-    ]
+    
+    private var results: [LatexResult] {
+        guard !appState.latexResult.isEmpty else { return [] }
+        return [
+            .init(id: 0, text: appState.latexResult),
+            .init(id: 1, text: "$\\begin{equation}\n\(appState.latexResult)\n\\end{equation}$"),
+            .init(id: 2, text: "$$ \(appState.latexResult) $$"),
+            .init(id: 3, text: "\\begin{equation} \(appState.latexResult) \\end{equation}")
+        ]
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -202,10 +505,21 @@ struct ResultsView: View {
             Divider()
 
             VStack(spacing: 0) {
-                ForEach(results) { result in
-                    ResultRow(result: result, copiedResultId: $copiedResultId)
-                    if result.id != results.last?.id {
-                        Divider()
+                if appState.isProcessing {
+                    Spacer()
+                    ProgressView()
+                    Spacer()
+                } else if results.isEmpty {
+                    Spacer()
+                    Text("No result to show.")
+                        .foregroundColor(MathpixTheme.textSecondary)
+                    Spacer()
+                } else {
+                    ForEach(results) { result in
+                        ResultRow(result: result, copiedResultId: $copiedResultId)
+                        if result.id != results.last?.id {
+                            Divider()
+                        }
                     }
                 }
             }
@@ -287,6 +601,8 @@ struct ActionButton: View {
 
 // MARK: - CONFIDENCE BAR
 struct ConfidenceBar: View {
+    @EnvironmentObject var appState: AppState
+
     var body: some View {
         VStack(spacing: 0) {
             Divider()
@@ -294,7 +610,7 @@ struct ConfidenceBar: View {
                 Text("Confidence")
                     .font(.system(size: 13))
                     .foregroundColor(MathpixTheme.textSecondary)
-                ProgressView(value: 1.0)
+                ProgressView(value: appState.confidence)
                     .progressViewStyle(LinearProgressViewStyle(tint: .green))
             }
             .padding(.horizontal, 12)
