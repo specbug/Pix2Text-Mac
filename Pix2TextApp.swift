@@ -488,11 +488,12 @@ struct ResultsView: View {
     
     private var results: [LatexResult] {
         guard !appState.latexResult.isEmpty else { return [] }
+        let latex = appState.latexResult
         return [
-            .init(id: 0, text: appState.latexResult),
-            .init(id: 1, text: "$\\begin{equation}\n\(appState.latexResult)\n\\end{equation}$"),
-            .init(id: 2, text: "$$ \(appState.latexResult) $$"),
-            .init(id: 3, text: "\\begin{equation} \(appState.latexResult) \\end{equation}")
+            .init(id: 0, text: latex),
+            .init(id: 1, text: "$\(latex)$"),
+            .init(id: 2, text: "$$\n\(latex)\n$$"),
+            .init(id: 3, text: "\\begin{equation}\n\(latex)\n\\end{equation}")
         ]
     }
     
@@ -542,6 +543,11 @@ struct ResultsView: View {
 struct LatexResult: Identifiable, Equatable {
     let id: Int
     let text: String
+
+    var displayText: String {
+        // This will collapse all whitespace (spaces, newlines, etc.) into a single space for a clean, single-line display.
+        text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    }
 }
 
 struct ResultRow: View {
@@ -559,7 +565,7 @@ struct ResultRow: View {
             NSPasteboard.general.setString(result.text, forType: .string)
         }) {
             HStack {
-                Text(result.text)
+                Text(result.displayText)
                     .font(.system(size: 14, design: .monospaced))
                     .foregroundColor(MathpixTheme.textPrimary)
                     .truncationMode(.tail)
