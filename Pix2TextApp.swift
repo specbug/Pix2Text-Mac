@@ -3,13 +3,146 @@ import AppKit
 import Combine
 import WebKit
 
-class AppState: ObservableObject {
-    @Published var capturedImage: NSImage?
-    @Published var latexResult: String = ""
-    @Published var isProcessing: Bool = false
-    @Published var confidence: Double = 0.0
+// MARK: - Data Models
+struct HistoryItem: Codable, Identifiable, Equatable {
+    let id: UUID
+    let timestamp: Date
+    let imagePath: String // path relative to snips directory
+    let latex: String
+    let confidence: Double
+}
 
+// MARK: - History Management
+class HistoryManager {
+    private let fileManager = FileManager.default
+    private var appSupportDirectory: URL
+    private var snipsDirectory: URL
+    private var historyFileURL: URL
+
+    init() {
+        guard let appSupportBase = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            fatalError("Could not find Application Support directory.")
+        }
+        self.appSupportDirectory = appSupportBase.appendingPathComponent("Pix2Text-Mac")
+        self.snipsDirectory = self.appSupportDirectory.appendingPathComponent("snips")
+        self.historyFileURL = self.appSupportDirectory.appendingPathComponent("history.json")
+        
+        createDirectoriesIfNeeded()
+    }
+
+    private func createDirectoriesIfNeeded() {
+        do {
+            try fileManager.createDirectory(at: snipsDirectory, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            print("Error creating snips directory: \(error)")
+        }
+    }
+
+    func loadHistory() -> [HistoryItem] {
+        guard fileManager.fileExists(atPath: historyFileURL.path) else { return [] }
+        do {
+            let data = try Data(contentsOf: historyFileURL)
+            let decoder = JSONDecoder()
+            let history = try decoder.decode([HistoryItem].self, from: data)
+            return history
+        } catch {
+            print("Error loading history: \(error)")
+            return []
+        }
+    }
+
+    func saveHistory(_ history: [HistoryItem]) {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            let data = try encoder.encode(history)
+            try data.write(to: historyFileURL)
+        } catch {
+            print("Error saving history: \(error)")
+        }
+    }
+
+    func addHistoryItem(from image: NSImage, with latex: String, confidence: Double) -> HistoryItem? {
+        let newItem = HistoryItem(id: UUID(), timestamp: Date(), imagePath: "\(UUID().uuidString).png", latex: latex, confidence: confidence)
+        
+        let imageURL = snipsDirectory.appendingPathComponent(newItem.imagePath)
+
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+
+        do {
+            try pngData.write(to: imageURL)
+            var currentHistory = loadHistory()
+            currentHistory.insert(newItem, at: 0)
+            saveHistory(currentHistory)
+            return newItem
+        } catch {
+            print("Error saving new snip image: \(error)")
+            return nil
+        }
+    }
+
+    func getImage(for item: HistoryItem) -> NSImage? {
+        let imageURL = snipsDirectory.appendingPathComponent(item.imagePath)
+        return NSImage(contentsOf: imageURL)
+    }
+    
+    func deleteHistory(at offsets: IndexSet, currentHistory: [HistoryItem]) -> [HistoryItem] {
+        var updatedHistory = currentHistory
+        let itemsToDelete = offsets.map { currentHistory[$0] }
+        
+        // Delete images from disk
+        for item in itemsToDelete {
+            let imageURL = snipsDirectory.appendingPathComponent(item.imagePath)
+            try? fileManager.removeItem(at: imageURL)
+        }
+        
+        // Remove from history array
+        updatedHistory.remove(atOffsets: offsets)
+        
+        // Save updated history
+        saveHistory(updatedHistory)
+        
+        return updatedHistory
+    }
+}
+
+class AppState: ObservableObject {
+    @Published var history: [HistoryItem] = []
+    @Published var currentHistoryIndex: Int?
+    @Published var isProcessing: Bool = false
+    @Published var isShowingHistory: Bool = false
+    
+    var currentItem: HistoryItem? {
+        guard let index = currentHistoryIndex, history.indices.contains(index) else { return nil }
+        return history[index]
+    }
+
+    var capturedImage: NSImage? {
+        guard let item = currentItem else { return nil }
+        return historyManager.getImage(for: item)
+    }
+    
+    var latexResult: String {
+        currentItem?.latex ?? ""
+    }
+
+    var confidence: Double {
+        currentItem?.confidence ?? 0.0
+    }
+
+    private var historyManager = HistoryManager()
     private var lastClipboardChangeCount = -1
+    
+    init() {
+        self.history = historyManager.loadHistory()
+        if !self.history.isEmpty {
+            self.currentHistoryIndex = 0
+        }
+    }
 
     func checkClipboardForImageAndProcess() {
         let pasteboard = NSPasteboard.general
@@ -22,10 +155,9 @@ class AppState: ObservableObject {
             return
         }
         
-        self.capturedImage = image
         self.isProcessing = true
-        self.latexResult = "Processing..."
-        self.confidence = 0.0
+        self.history.insert(HistoryItem(id: UUID(), timestamp: Date(), imagePath: "", latex: "Processing...", confidence: 0), at: 0)
+        self.currentHistoryIndex = 0
         
         callPix2Text(with: image)
     }
@@ -33,7 +165,9 @@ class AppState: ObservableObject {
     private func callPix2Text(with image: NSImage) {
         guard let tempURL = saveImageTemporarily(image) else {
             DispatchQueue.main.async {
-                self.latexResult = "Error: Could not save image for processing."
+                self.history.removeFirst()
+                if self.history.isEmpty { self.currentHistoryIndex = nil }
+                print("Error: Could not save image for processing.")
                 self.isProcessing = false
             }
             return
@@ -48,7 +182,9 @@ class AppState: ObservableObject {
             
             guard FileManager.default.fileExists(atPath: pythonPath) else {
                 DispatchQueue.main.async {
-                    self.latexResult = "Error: Python venv not found at \(pythonPath). Please update the path in Pix2TextApp.swift"
+                    self.history.removeFirst()
+                    if self.history.isEmpty { self.currentHistoryIndex = nil }
+                    print("Error: Python venv not found at \(pythonPath). Please update the path in Pix2TextApp.swift")
                     self.isProcessing = false
                 }
                 return
@@ -56,7 +192,9 @@ class AppState: ObservableObject {
             
             guard let scriptPath = Bundle.main.path(forResource: "pix2text_bridge", ofType: "py") else {
                 DispatchQueue.main.async {
-                    self.latexResult = "Error: pix2text_bridge.py not found in app bundle."
+                    self.history.removeFirst()
+                    if self.history.isEmpty { self.currentHistoryIndex = nil }
+                    print("Error: pix2text_bridge.py not found in app bundle.")
                     self.isProcessing = false
                     try? FileManager.default.removeItem(at: tempURL)
                 }
@@ -89,7 +227,7 @@ class AppState: ObservableObject {
                 }
 
                 if let jsonString = self.extractJsonString(from: rawOutput) {
-                    self.parsePythonResponse(jsonString)
+                    self.parsePythonResponse(jsonString, for: image)
                 } else {
                     DispatchQueue.main.async {
                         var errorMessage = "Error: Could not find valid JSON in script output."
@@ -99,13 +237,17 @@ class AppState: ObservableObject {
                         if !errOutput.isEmpty {
                             errorMessage += "\n\n--- Script Error Log ---\n\(errOutput)"
                         }
-                        self.latexResult = errorMessage
+                        self.history.removeFirst()
+                        if self.history.isEmpty { self.currentHistoryIndex = nil }
+                        print(errorMessage)
                         self.isProcessing = false
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.latexResult = "Error: Failed to run script. \(error.localizedDescription)"
+                    self.history.removeFirst()
+                    if self.history.isEmpty { self.currentHistoryIndex = nil }
+                    print("Error: Failed to run script. \(error.localizedDescription)")
                     self.isProcessing = false
                 }
             }
@@ -181,16 +323,19 @@ class AppState: ObservableObject {
         return nil
     }
 
-    private func parsePythonResponse(_ response: String) {
+    private func parsePythonResponse(_ response: String, for image: NSImage) {
         guard let data = response.data(using: .utf8) else {
             DispatchQueue.main.async {
-                self.latexResult = "Error: Could not decode script response."
+                self.history.removeFirst()
+                if self.history.isEmpty { self.currentHistoryIndex = nil }
+                print("Error: Could not decode script response.")
                 self.isProcessing = false
             }
             return
         }
 
         DispatchQueue.main.async {
+            self.history.removeFirst() // Remove temporary "Processing..." item
             do {
                 if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
                     if let error = json["error"] as? String {
@@ -198,21 +343,52 @@ class AppState: ObservableObject {
                         if let traceback = json["traceback"] as? String {
                             errorMessage += "\n\n--- Traceback ---\n\(traceback)"
                         }
-                        self.latexResult = errorMessage
-                        self.confidence = 0.0
-                    } else if let latex = json["latex"] as? String {
-                        self.latexResult = self.cleanLatexString(latex)
-                        self.confidence = json["confidence"] as? Double ?? 0.0
+                        // Not adding to history on error
+                        print(errorMessage)
+                    } else if let latex = json["latex"] as? String, let confidence = json["confidence"] as? Double {
+                        let cleanedLatex = self.cleanLatexString(latex)
+                        if let newItem = self.historyManager.addHistoryItem(from: image, with: cleanedLatex, confidence: confidence) {
+                            self.history.insert(newItem, at: 0)
+                            self.currentHistoryIndex = 0
+                        }
                     } else {
-                        self.latexResult = "Error: Invalid JSON response from script."
-                        self.confidence = 0.0
+                         print("Error: Invalid JSON response from script.")
                     }
                 }
             } catch {
-                self.latexResult = "Error: Failed to parse JSON. \(error.localizedDescription)"
-                self.confidence = 0.0
+                print("Error: Failed to parse JSON. \(error.localizedDescription)")
             }
+            
+            if self.history.isEmpty {
+                self.currentHistoryIndex = nil
+            } else if self.currentHistoryIndex == nil {
+                self.currentHistoryIndex = 0
+            }
+            
             self.isProcessing = false
+        }
+    }
+    
+    func goToNextItem() {
+        guard let index = currentHistoryIndex, !history.isEmpty else { return }
+        if index < history.count - 1 {
+            currentHistoryIndex = index + 1
+        }
+    }
+
+    func goToPreviousItem() {
+        guard let index = currentHistoryIndex, !history.isEmpty else { return }
+        if index > 0 {
+            currentHistoryIndex = index - 1
+        }
+    }
+    
+    func deleteHistory(at offsets: IndexSet) {
+        history = historyManager.deleteHistory(at: offsets, currentHistory: history)
+        if history.isEmpty {
+            currentHistoryIndex = nil
+        } else if let index = currentHistoryIndex, index >= history.count {
+            currentHistoryIndex = history.count - 1
         }
     }
 }
@@ -286,20 +462,33 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             TopBarView()
+                .environmentObject(appState)
             Divider()
-            ImageAndFormulaView()
-            ResultsView()
-            ConfidenceBar()
+            if appState.isShowingHistory {
+                HistoryView()
+            } else {
+                MainContentView()
+            }
         }
         .background(MathpixTheme.background)
         .onAppear {
-            appState.checkClipboardForImageAndProcess()
+            // appState.checkClipboardForImageAndProcess() // This can be annoying on every open
         }
+    }
+}
+
+struct MainContentView: View {
+    var body: some View {
+        ImageAndFormulaView()
+        ResultsView()
+        ConfidenceBar()
     }
 }
 
 // MARK: - TOP BAR
 struct TopBarView: View {
+    @EnvironmentObject var appState: AppState
+
     var body: some View {
         HStack(spacing: 16) {
             // Left Action Icons
@@ -308,16 +497,29 @@ struct TopBarView: View {
                 ToolButton(systemName: "arrow.up.doc")
                 ToolButton(systemName: "scribble")
                 ToolButton(systemName: "keyboard")
-                ToolButton(systemName: "list.bullet")
+                Button(action: { appState.isShowingHistory.toggle() }) {
+                    Image(systemName: "list.bullet")
+                        .font(.system(size: 18))
+                        .foregroundColor(MathpixTheme.textSecondary)
+                }
+                .buttonStyle(PlainButtonStyle())
             }
             
             Spacer()
             
             // Pagination
             HStack(spacing: 8) {
-                Button(action: {}) { Image(systemName: "chevron.left") }
-                Text("2/2").font(.system(size: 14, weight: .medium))
-                Button(action: {}) { Image(systemName: "chevron.right") }
+                Button(action: { appState.goToPreviousItem() }) { Image(systemName: "chevron.left") }
+                    .disabled(appState.currentHistoryIndex ?? 0 == 0)
+                
+                if !appState.history.isEmpty && appState.currentHistoryIndex != nil {
+                    Text("\(appState.currentHistoryIndex! + 1)/\(appState.history.count)").font(.system(size: 14, weight: .medium))
+                } else {
+                    Text("0/0").font(.system(size: 14, weight: .medium))
+                }
+                
+                Button(action: { appState.goToNextItem() }) { Image(systemName: "chevron.right") }
+                    .disabled(appState.currentHistoryIndex ?? 0 >= appState.history.count - 1)
             }
             .buttonStyle(PlainButtonStyle())
             .foregroundColor(MathpixTheme.textSecondary)
@@ -326,7 +528,18 @@ struct TopBarView: View {
             
             // Right Action Icons
             HStack(spacing: 12) {
-                ToolButton(systemName: "trash")
+                Button(action: {
+                    if !appState.isShowingHistory, let index = appState.currentHistoryIndex {
+                        appState.deleteHistory(at: IndexSet(integer: index))
+                    }
+                }) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 18))
+                        .foregroundColor(appState.isShowingHistory ? .gray : MathpixTheme.textSecondary)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .disabled(appState.isShowingHistory)
+
                 ToolButton(systemName: "gearshape")
             }
         }
@@ -392,7 +605,7 @@ struct ImageAndFormulaView: View {
                     }
                 }
 
-                if appState.isProcessing {
+                if appState.isProcessing && appState.currentItem?.latex == "Processing..." {
                     ProgressView()
                 } else if !appState.latexResult.isEmpty {
                     LatexView(latex: appState.latexResult)
@@ -520,8 +733,13 @@ struct ResultsView: View {
                     Spacer()
                 } else if results.isEmpty {
                     Spacer()
-                    Text("No result to show.")
-                        .foregroundColor(MathpixTheme.textSecondary)
+                    if appState.history.isEmpty {
+                        Text("Copy an image to get started.")
+                            .foregroundColor(MathpixTheme.textSecondary)
+                    } else {
+                        Text("No result to show.")
+                            .foregroundColor(MathpixTheme.textSecondary)
+                    }
                     Spacer()
                 } else {
                     ForEach(results) { result in
@@ -665,5 +883,83 @@ extension Color {
             blue: Double(b) / 255,
             opacity: Double(a) / 255
         )
+    }
+}
+
+// MARK: - HISTORY VIEW
+struct HistoryView: View {
+    @EnvironmentObject var appState: AppState
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 20),
+        GridItem(.flexible(), spacing: 20)
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if appState.history.isEmpty {
+                Spacer()
+                Text("No history yet.")
+                    .foregroundColor(MathpixTheme.textSecondary)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 20) {
+                        ForEach(Array(appState.history.enumerated()), id: \.element.id) { index, item in
+                            ZStack(alignment: .topTrailing) {
+                                HistoryTileView(item: item)
+                                    .onTapGesture {
+                                        appState.currentHistoryIndex = index
+                                        appState.isShowingHistory = false
+                                    }
+
+                                Button(action: {
+                                    appState.deleteHistory(at: IndexSet(integer: index))
+                                }) {
+                                    Image(systemName: "trash")
+                                        .foregroundColor(MathpixTheme.textSecondary)
+                                        .font(.system(size: 16))
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                                .padding(8)
+                            }
+                        }
+                    }
+                    .padding(20)
+                }
+                .onDeleteCommand {
+                    guard let index = appState.currentHistoryIndex else { return }
+                    appState.deleteHistory(at: IndexSet(integer: index))
+                }
+            }
+        }
+        .background(MathpixTheme.background)
+    }
+}
+
+struct HistoryTileView: View {
+    let item: HistoryItem
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
+    var body: some View {
+        VStack(spacing: 10) {
+            LatexView(latex: item.latex)
+                .frame(height: 120)
+                .padding(12)
+                .background(MathpixTheme.contentBackground)
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(MathpixTheme.borderColor, lineWidth: 1)
+                )
+
+            Text(Self.relativeDateFormatter.localizedString(for: item.timestamp, relativeTo: Date()))
+                .font(.system(size: 12))
+                .foregroundColor(MathpixTheme.textSecondary)
+        }
     }
 } 
