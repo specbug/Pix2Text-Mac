@@ -526,7 +526,10 @@ struct ResultsView: View {
                     ForEach(results) { result in
                         ResultRow(result: result, copiedResultId: $copiedResultId)
                         if result.id != results.last?.id {
-                            Divider()
+                            Rectangle()
+                                .frame(height: 0.5)
+                                .foregroundColor(Color.black.opacity(0.15))
+                                .padding(.horizontal, 12)
                         }
                     }
                 }
@@ -557,34 +560,38 @@ struct ResultRow: View {
         }) {
             HStack {
                 Text(result.text)
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: 14, design: .monospaced))
                     .foregroundColor(MathpixTheme.textPrimary)
                     .truncationMode(.tail)
                     .lineLimit(1)
                 
                 if isCopied {
                     Text("COPIED")
-                        .font(.system(size: 11, weight: .bold))
+                        .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(MathpixTheme.accentBlue.cornerRadius(4))
-                        .padding(.leading, 4)
+                        .background(MathpixTheme.accentBlue.cornerRadius(6))
+                        .padding(.leading, 8)
                 }
                 
                 Spacer()
                 
-                HStack(spacing: 16) {
-                    Button(action: {}) { Image(systemName: "doc.on.doc") }
-                    Button(action: {}) { Image(systemName: "pencil") }
+                HStack(spacing: 18) {
+                    Button(action: {
+                        self.copiedResultId = result.id
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(result.text, forType: .string)
+                    }) { Image(systemName: "doc.on.clipboard") }
+                    Button(action: {}) { Image(systemName: "pencil.and.outline") }
                     Button(action: {}) { Image(systemName: "magnifyingglass") }
                 }
                 .buttonStyle(PlainButtonStyle())
                 .foregroundColor(MathpixTheme.textSecondary)
                 .font(.system(size: 16))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 16)
             .contentShape(Rectangle())
             .background(isCopied ? MathpixTheme.copiedBlueBG : Color.clear)
         }.buttonStyle(PlainButtonStyle())
