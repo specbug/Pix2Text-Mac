@@ -78,11 +78,19 @@ class AppState: ObservableObject {
                 task.waitUntilExit()
                 
                 let rawOutput = String(data: outData, encoding: .utf8) ?? ""
+                let errOutput = String(data: errData, encoding: .utf8) ?? ""
+
+                // Log full output to Xcode console for debugging
+                if !rawOutput.isEmpty {
+                    print("--- Python Script stdout ---\n\(rawOutput)")
+                }
+                if !errOutput.isEmpty {
+                    print("--- Python Script stderr ---\n\(errOutput)")
+                }
 
                 if let jsonString = self.extractJsonString(from: rawOutput) {
                     self.parsePythonResponse(jsonString)
                 } else {
-                    let errOutput = String(data: errData, encoding: .utf8) ?? ""
                     DispatchQueue.main.async {
                         var errorMessage = "Error: Could not find valid JSON in script output."
                         if !rawOutput.isEmpty {
