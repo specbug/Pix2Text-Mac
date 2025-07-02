@@ -476,7 +476,7 @@ struct LatexView: NSViewRepresentable {
 // MARK: - RESULTS LIST
 struct ResultsView: View {
     @EnvironmentObject var appState: AppState
-    @State private var copiedResultId: Int? = 0
+    @State private var copiedResultId: Int?
     
     private var results: [LatexResult] {
         guard !appState.latexResult.isEmpty else { return [] }
