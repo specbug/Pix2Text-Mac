@@ -414,7 +414,7 @@ struct LatexView: NSViewRepresentable {
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
         let html = katexHTML(with: latex)
-        nsView.loadHTMLString(html, baseURL: nil)
+        nsView.loadHTMLString(html, baseURL: Bundle.main.resourceURL)
     }
 
     private func katexHTML(with latexString: String) -> String {
@@ -428,8 +428,8 @@ struct LatexView: NSViewRepresentable {
         <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.css" integrity="sha384-vKruJ+a13U8yHIkAyOUuDfiCvE9mdLPJNcrOOLAupAbGdxvs2goRaN2uhpqkvUUB" crossorigin="anonymous">
-            <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.4/dist/katex.min.js" integrity="sha384-PwRUT/YqbnEjkMWVphVRFF3eGmMKaTmmvYypNoLgjGkhtuUY_9VycKDVJAk1SgQ/" crossorigin="anonymous"></script>
+            <link rel="stylesheet" href="katex.min.css">
+            <script defer src="katex.min.js"></script>
             <style>
                 body {
                     display: flex;
